@@ -1,9 +1,9 @@
 use std::{collections::vec_deque::VecDeque, io, time::Duration};
 
-#[cfg(unix)]
-use crate::event::source::unix::UnixInternalEventSource;
 #[cfg(windows)]
 use crate::event::source::windows::WindowsEventSource;
+#[cfg(unix)]
+use crate::event::source::{unix::UnixInternalEventSource, GraphicsProbe};
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
 use crate::event::{filter::Filter, source::EventSource, timeout::PollTimeout, InternalEvent};
@@ -33,6 +33,13 @@ impl Default for InternalEventReader {
 }
 
 impl InternalEventReader {
+    #[cfg(unix)]
+    pub(crate) fn set_graphics_probe(&mut self, probe: GraphicsProbe) {
+        if let Some(source) = &mut self.source {
+            source.set_graphics_probe(probe);
+        }
+    }
+
     /// Returns a `Waker` allowing to wake/force the `poll` method to return `Ok(false)`.
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
@@ -68,11 +75,14 @@ impl InternalEventReader {
                     if filter.eval(&event) {
                         Some(event)
                     } else {
-                        self.skipped_events.push(event);
+                        if !event.is_graphics_probe_reply() {
+                            self.skipped_events.push(event);
+                        }
                         None
                     }
                 }
                 Err(e) => {
+                    self.events.extend(self.skipped_events.drain(..));
                     if e.kind() == io::ErrorKind::Interrupted {
                         return Ok(false);
                     }
@@ -222,6 +232,32 @@ mod tests {
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), SKIPPED_EVENT);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn graphics_probe_preserves_input_and_discards_unmatched_replies() {
+        use super::super::filter::{EventFilter, GraphicsProbeFilter};
+
+        let key = |ch| InternalEvent::Event(Event::Key(super::super::KeyCode::Char(ch).into()));
+        let reply = |image_id| InternalEvent::KittyGraphicsReply { image_id, ok: true };
+        let source = FakeSource::with_events(&[key('a'), reply(1), key('b'), reply(2), reply(3)]);
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(source)),
+            skipped_events: Vec::with_capacity(32),
+        };
+        let filter = GraphicsProbeFilter { image_id: 2 };
+        assert!(reader
+            .poll(Some(Duration::from_millis(10)), &filter)
+            .unwrap());
+        assert_eq!(reader.read(&filter).unwrap(), reply(2));
+        assert_eq!(reader.read(&EventFilter).unwrap(), key('a'));
+        assert_eq!(reader.read(&EventFilter).unwrap(), key('b'));
+        assert!(!reader
+            .poll(Some(Duration::from_millis(1)), &EventFilter)
+            .unwrap());
+        assert!(reader.events.is_empty());
     }
 
     #[test]

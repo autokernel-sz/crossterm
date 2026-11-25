@@ -1,4 +1,6 @@
-use std::{collections::VecDeque, io, time::Duration};
+use super::next_input_event;
+use super::parser::Parser;
+use std::{io, time::Duration};
 
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use signal_hook_mio::v1_0::Signals;
@@ -6,7 +8,9 @@ use signal_hook_mio::v1_0::Signals;
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
 use crate::event::{
-    source::EventSource, sys::unix::parse::parse_event, timeout::PollTimeout, Event, InternalEvent,
+    source::{EventSource, GraphicsProbe},
+    timeout::PollTimeout,
+    Event, InternalEvent,
 };
 use crate::terminal::sys::file_descriptor::{tty_fd, FileDesc};
 
@@ -27,6 +31,7 @@ pub(crate) struct UnixInternalEventSource {
     parser: Parser,
     tty_buffer: [u8; TTY_BUFFER_SIZE],
     tty_fd: FileDesc<'static>,
+    input_ready: bool,
     signals: Signals,
     #[cfg(feature = "event-stream")]
     waker: Waker,
@@ -57,68 +62,75 @@ impl UnixInternalEventSource {
             parser: Parser::default(),
             tty_buffer: [0u8; TTY_BUFFER_SIZE],
             tty_fd: input_fd,
+            input_ready: false,
             signals,
             #[cfg(feature = "event-stream")]
             waker,
         })
     }
+
+    fn next_event(&mut self) -> io::Result<Option<InternalEvent>> {
+        let (event, read_input) =
+            next_input_event(&mut self.parser, &self.tty_fd, &mut self.tty_buffer)?;
+        self.input_ready |= read_input;
+        Ok(event)
+    }
 }
 
 impl EventSource for UnixInternalEventSource {
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>> {
-        if let Some(event) = self.parser.next() {
-            return Ok(Some(event));
-        }
-
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if let Err(e) = self.poll.poll(&mut self.events, timeout.leftover()) {
+            if let Some(event) = self.next_event()? {
+                return Ok(Some(event));
+            }
+            if self.input_ready {
+                match self.tty_fd.read_if_ready(&mut self.tty_buffer) {
+                    Ok(Some(0)) => return Err(io::ErrorKind::UnexpectedEof.into()),
+                    Ok(Some(count)) => {
+                        self.parser
+                            .advance(&self.tty_buffer[..count], count == TTY_BUFFER_SIZE);
+                        if let Some(event) = self.next_event()? {
+                            return Ok(Some(event));
+                        }
+                        if timeout.elapsed() {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    Ok(None) => self.input_ready = false,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        if timeout.elapsed() {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            if let Err(e) = self.poll.poll(
+                &mut self.events,
+                self.parser.poll_timeout(timeout.leftover()),
+            ) {
                 // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
                 // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
                 // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
-                if e.kind() == io::ErrorKind::Interrupted {
+                if e.kind() == io::ErrorKind::Interrupted && !timeout.elapsed() {
                     continue;
+                } else if e.kind() == io::ErrorKind::Interrupted {
+                    return Ok(None);
                 } else {
                     return Err(e);
                 }
             };
 
-            if self.events.is_empty() {
-                // No readiness events = timeout
-                return Ok(None);
-            }
-
+            // mio reports edges. Carry unread readiness over if an event is
+            // returned before the descriptor has been drained.
+            self.input_ready = self.events.iter().any(|event| event.token() == TTY_TOKEN);
             for token in self.events.iter().map(|x| x.token()) {
                 match token {
-                    TTY_TOKEN => {
-                        loop {
-                            match self.tty_fd.read(&mut self.tty_buffer) {
-                                Ok(read_count) => {
-                                    if read_count > 0 {
-                                        self.parser.advance(
-                                            &self.tty_buffer[..read_count],
-                                            read_count == TTY_BUFFER_SIZE,
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    // No more data to read at the moment. We will receive another event
-                                    if e.kind() == io::ErrorKind::WouldBlock {
-                                        break;
-                                    }
-                                    // once more data is available to read.
-                                    else if e.kind() == io::ErrorKind::Interrupted {
-                                        continue;
-                                    }
-                                }
-                            };
-
-                            if let Some(event) = self.parser.next() {
-                                return Ok(Some(event));
-                            }
-                        }
-                    }
+                    TTY_TOKEN => {}
                     SIGNAL_TOKEN => {
                         if self.signals.pending().next() == Some(signal_hook::consts::SIGWINCH) {
                             // TODO Should we remove tput?
@@ -146,84 +158,18 @@ impl EventSource for UnixInternalEventSource {
             }
 
             // Processing above can take some time, check if timeout expired
-            if timeout.elapsed() {
-                return Ok(None);
+            if timeout.elapsed() && !self.input_ready {
+                return self.next_event();
             }
         }
+    }
+
+    fn set_graphics_probe(&mut self, probe: GraphicsProbe) {
+        self.parser.set_graphics_probe(probe);
     }
 
     #[cfg(feature = "event-stream")]
     fn waker(&self) -> Waker {
         self.waker.clone()
-    }
-}
-
-//
-// Following `Parser` structure exists for two reasons:
-//
-//  * mimic anes Parser interface
-//  * move the advancing, parsing, ... stuff out of the `try_read` method
-//
-#[derive(Debug)]
-struct Parser {
-    buffer: Vec<u8>,
-    internal_events: VecDeque<InternalEvent>,
-}
-
-impl Default for Parser {
-    fn default() -> Self {
-        Parser {
-            // This buffer is used for -> 1 <- ANSI escape sequence. Are we
-            // aware of any ANSI escape sequence that is bigger? Can we make
-            // it smaller?
-            //
-            // Probably not worth spending more time on this as "there's a plan"
-            // to use the anes crate parser.
-            buffer: Vec::with_capacity(256),
-            // TTY_BUFFER_SIZE is 1_024 bytes. How many ANSI escape sequences can
-            // fit? What is an average sequence length? Let's guess here
-            // and say that the average ANSI escape sequence length is 8 bytes. Thus
-            // the buffer size should be 1024/8=128 to avoid additional allocations
-            // when processing large amounts of data.
-            //
-            // There's no need to make it bigger, because when you look at the `try_read`
-            // method implementation, all events are consumed before the next TTY_BUFFER
-            // is processed -> events pushed.
-            internal_events: VecDeque::with_capacity(128),
-        }
-    }
-}
-
-impl Parser {
-    fn advance(&mut self, buffer: &[u8], more: bool) {
-        for (idx, byte) in buffer.iter().enumerate() {
-            let more = idx + 1 < buffer.len() || more;
-
-            self.buffer.push(*byte);
-
-            match parse_event(&self.buffer, more) {
-                Ok(Some(ie)) => {
-                    self.internal_events.push_back(ie);
-                    self.buffer.clear();
-                }
-                Ok(None) => {
-                    // Event can't be parsed, because we don't have enough bytes for
-                    // the current sequence. Keep the buffer and process next bytes.
-                }
-                Err(_) => {
-                    // Event can't be parsed (not enough parameters, parameter is not a number, ...).
-                    // Clear the buffer and continue with another sequence.
-                    self.buffer.clear();
-                }
-            }
-        }
-    }
-}
-
-impl Iterator for Parser {
-    type Item = InternalEvent;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.internal_events.pop_front()
     }
 }

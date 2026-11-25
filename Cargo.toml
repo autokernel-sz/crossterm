@@ -43,6 +43,7 @@ events = [
     "dep:mio",
     "dep:signal-hook",
     "dep:signal-hook-mio",
+    "rustix/event",
 ] # Enables reading input/events from the system.
 serde = ["dep:serde", "bitflags/serde"] # Enables 'serde' for various types.
 

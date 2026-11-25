@@ -252,6 +252,66 @@ pub fn read() -> std::io::Result<Event> {
     }
 }
 
+/// Queries the terminal software version and tests whether a Kitty graphics
+/// query can load the supplied one-pixel PNG. Requires raw mode. Call before
+/// starting an event stream so the shared input reader is available.
+///
+/// Returns the version string only after both replies arrive. Ordinary input
+/// is left in the reader's event queue.
+#[cfg(unix)]
+pub fn query_kitty_graphics(
+    writer: &mut impl std::io::Write,
+    image_id: u32,
+    png_base64: &str,
+    timeout: Duration,
+) -> std::io::Result<Option<String>> {
+    use self::source::GraphicsProbe;
+    use std::time::Instant;
+
+    let deadline = Instant::now() + timeout;
+    let Some(mut reader) = try_lock_internal_event_reader_for(timeout) else {
+        return Ok(None);
+    };
+    reader.set_graphics_probe(GraphicsProbe::Started(deadline));
+    let result = (|| {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        write!(
+            writer,
+            "\x1b[>0q\x1b_Ga=q,t=d,f=100,i={image_id};{png_base64}\x1b\\"
+        )?;
+        writer.flush()?;
+
+        let filter = filter::GraphicsProbeFilter { image_id };
+        let mut version = None;
+        let mut acknowledged = false;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || !reader.poll(Some(remaining), &filter)? {
+                return Ok(None);
+            }
+            let event = reader.read(&filter)?;
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            match event {
+                InternalEvent::TerminalVersion(value) => version = Some(value),
+                InternalEvent::KittyGraphicsReply { ok: false, .. } => return Ok(None),
+                InternalEvent::KittyGraphicsReply { ok: true, .. } => acknowledged = true,
+                _ => unreachable!(),
+            }
+            if acknowledged && version.is_some() {
+                return Ok(version);
+            }
+        }
+    })();
+    reader.set_graphics_probe(GraphicsProbe::Finished {
+        expect_late_replies: !matches!(&result, Ok(Some(_))),
+    });
+    result
+}
+
 /// Polls to check if there are any `InternalEvent`s that can be read within the given duration.
 pub(crate) fn poll_internal<F>(timeout: Option<Duration>, filter: &F) -> std::io::Result<bool>
 where
@@ -1186,6 +1246,27 @@ pub(crate) enum InternalEvent {
     /// OSC color response (`slot`, `payload`).
     #[cfg(unix)]
     OscColor { slot: u8, payload: OscColorPayload },
+    #[cfg(unix)]
+    TerminalVersion(String),
+    #[cfg(unix)]
+    KittyGraphicsReply { image_id: u32, ok: bool },
+}
+
+impl InternalEvent {
+    /// Probe replies have no meaning for normal event consumers.
+    pub(crate) fn is_graphics_probe_reply(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(
+                self,
+                Self::TerminalVersion(_) | Self::KittyGraphicsReply { .. }
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
 }
 
 /// Parsed payload of an OSC color response.

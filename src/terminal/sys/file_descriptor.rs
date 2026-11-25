@@ -109,6 +109,39 @@ impl AsRawFd for FileDesc<'_> {
     }
 }
 
+impl FileDesc<'_> {
+    /// Read immediately available input without changing the descriptor's
+    /// blocking mode, which may be shared with the shell or child programs.
+    #[cfg(feature = "events")]
+    pub(crate) fn read_if_ready(&self, buffer: &mut [u8]) -> io::Result<Option<usize>> {
+        #[cfg(feature = "libc")]
+        let ready = {
+            let mut fd = libc::pollfd {
+                fd: self.raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            match unsafe { libc::poll(&mut fd, 1, 0) } {
+                -1 => return Err(io::Error::last_os_error()),
+                count => count > 0,
+            }
+        };
+        #[cfg(not(feature = "libc"))]
+        let ready = {
+            use rustix::event::{poll, PollFd, PollFlags};
+            poll(&mut [PollFd::new(self, PollFlags::IN)], 0)? != 0
+        };
+
+        if !ready {
+            return Ok(None);
+        }
+        match self.read(buffer) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            result => result.map(Some),
+        }
+    }
+}
+
 #[cfg(not(feature = "libc"))]
 impl AsFd for FileDesc<'_> {
     fn as_fd(&self) -> BorrowedFd<'_> {

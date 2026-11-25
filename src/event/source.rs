@@ -9,6 +9,12 @@ pub(crate) mod unix;
 #[cfg(windows)]
 pub(crate) mod windows;
 
+#[cfg(unix)]
+pub(crate) enum GraphicsProbe {
+    Started(std::time::Instant),
+    Finished { expect_late_replies: bool },
+}
+
 /// An interface for trying to read an `InternalEvent` within an optional `Duration`.
 pub(crate) trait EventSource: Sync + Send {
     /// Tries to read an `InternalEvent` within the given duration.
@@ -20,6 +26,9 @@ pub(crate) trait EventSource: Sync + Send {
     ///
     /// Returns `Ok(None)` if there's no event available and timeout expires.
     fn try_read(&mut self, timeout: Option<Duration>) -> io::Result<Option<InternalEvent>>;
+
+    #[cfg(unix)]
+    fn set_graphics_probe(&mut self, _probe: GraphicsProbe) {}
 
     /// Returns a `Waker` allowing to wake/force the `try_read` method to return `Ok(None)`.
     #[cfg(feature = "event-stream")]

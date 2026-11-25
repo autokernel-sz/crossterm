@@ -65,6 +65,22 @@ impl Filter for OscColorFilter {
 #[derive(Debug, Clone)]
 pub(crate) struct EventFilter;
 
+#[cfg(unix)]
+pub(crate) struct GraphicsProbeFilter {
+    pub(crate) image_id: u32,
+}
+
+#[cfg(unix)]
+impl Filter for GraphicsProbeFilter {
+    fn eval(&self, event: &InternalEvent) -> bool {
+        match event {
+            InternalEvent::TerminalVersion(_) => true,
+            InternalEvent::KittyGraphicsReply { image_id, .. } => *image_id == self.image_id,
+            _ => false,
+        }
+    }
+}
+
 impl Filter for EventFilter {
     #[cfg(unix)]
     fn eval(&self, event: &InternalEvent) -> bool {
@@ -78,24 +94,25 @@ impl Filter for EventFilter {
 }
 
 #[cfg(test)]
+pub(crate) struct InternalEventFilter;
+
+#[cfg(test)]
+impl Filter for InternalEventFilter {
+    fn eval(&self, _: &InternalEvent) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
 #[cfg(unix)]
 mod tests {
     use super::{
-        CursorPositionFilter, EventFilter, Filter, KeyboardEnhancementFlagsFilter, OscColorFilter,
-        PrimaryDeviceAttributesFilter,
+        CursorPositionFilter, EventFilter, Filter, InternalEventFilter,
+        KeyboardEnhancementFlagsFilter, OscColorFilter, PrimaryDeviceAttributesFilter,
     };
     use crate::event::Event;
     use crate::event::{InternalEvent, OscColorPayload};
     use InternalEvent::OscColor;
-
-    #[derive(Debug, Clone)]
-    struct InternalEventFilter;
-
-    impl Filter for InternalEventFilter {
-        fn eval(&self, _: &InternalEvent) -> bool {
-            true
-        }
-    }
 
     #[test]
     fn test_cursor_position_filter_filters_cursor_position() {
