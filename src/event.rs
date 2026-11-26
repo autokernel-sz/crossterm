@@ -272,16 +272,15 @@ pub fn query_kitty_graphics(
     let Some(mut reader) = try_lock_internal_event_reader_for(timeout) else {
         return Ok(None);
     };
+    if reader.has_pending_graphics_query() {
+        return Err(std::io::ErrorKind::WouldBlock.into());
+    }
     reader.set_graphics_probe(GraphicsProbe::Started(deadline));
     let result = (|| {
         if Instant::now() >= deadline {
             return Ok(None);
         }
-        write!(
-            writer,
-            "\x1b[>0q\x1b_Ga=q,t=d,f=100,i={image_id};{png_base64}\x1b\\"
-        )?;
-        writer.flush()?;
+        write_kitty_graphics_query(writer, image_id, png_base64)?;
 
         let filter = filter::GraphicsProbeFilter { image_id };
         let mut version = None;
@@ -310,6 +309,41 @@ pub fn query_kitty_graphics(
         expect_late_replies: !matches!(&result, Ok(Some(_))),
     });
     result
+}
+
+/// Start a Kitty PNG and terminal version query without waiting for its replies.
+/// Requires raw mode. Call before starting an event stream, or after dropping
+/// the previous one. The shared input reader resolves the query while polling
+/// for ordinary input. The completion callback must not call into the reader.
+#[cfg(unix)]
+pub fn begin_kitty_graphics_query(
+    writer: &mut impl std::io::Write,
+    image_id: u32,
+    png_base64: &str,
+    timeout: Duration,
+    on_complete: impl FnOnce(Option<String>) + Send + 'static,
+) -> std::io::Result<std::time::Instant> {
+    let mut reader = lock_internal_event_reader();
+    let deadline = std::time::Instant::now() + timeout;
+    reader.begin_graphics_query(deadline, image_id, on_complete)?;
+    if let Err(error) = write_kitty_graphics_query(writer, image_id, png_base64) {
+        reader.finish_graphics_query(None);
+        return Err(error);
+    }
+    Ok(deadline)
+}
+
+#[cfg(unix)]
+fn write_kitty_graphics_query(
+    writer: &mut impl std::io::Write,
+    image_id: u32,
+    png_base64: &str,
+) -> std::io::Result<()> {
+    write!(
+        writer,
+        "\x1b[>0q\x1b_Ga=q,t=d,f=100,i={image_id};{png_base64}\x1b\\"
+    )?;
+    writer.flush()
 }
 
 /// Polls to check if there are any `InternalEvent`s that can be read within the given duration.

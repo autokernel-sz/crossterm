@@ -1,5 +1,10 @@
 use std::{collections::vec_deque::VecDeque, io, time::Duration};
 
+#[cfg(unix)]
+use std::time::Instant;
+
+#[cfg(unix)]
+use crate::event::filter::GraphicsProbeFilter;
 #[cfg(windows)]
 use crate::event::source::windows::WindowsEventSource;
 #[cfg(unix)]
@@ -13,6 +18,17 @@ pub(crate) struct InternalEventReader {
     events: VecDeque<InternalEvent>,
     source: Option<Box<dyn EventSource>>,
     skipped_events: Vec<InternalEvent>,
+    #[cfg(unix)]
+    graphics_query: Option<PendingGraphicsQuery>,
+}
+
+#[cfg(unix)]
+struct PendingGraphicsQuery {
+    deadline: Instant,
+    filter: GraphicsProbeFilter,
+    version: Option<String>,
+    acknowledged: bool,
+    on_complete: Box<dyn FnOnce(Option<String>) + Send>,
 }
 
 impl Default for InternalEventReader {
@@ -28,6 +44,8 @@ impl Default for InternalEventReader {
             source,
             events: VecDeque::with_capacity(32),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         }
     }
 }
@@ -40,6 +58,73 @@ impl InternalEventReader {
         }
     }
 
+    #[cfg(unix)]
+    pub(crate) fn has_pending_graphics_query(&self) -> bool {
+        self.graphics_query.is_some()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn begin_graphics_query(
+        &mut self,
+        deadline: Instant,
+        image_id: u32,
+        on_complete: impl FnOnce(Option<String>) + Send + 'static,
+    ) -> io::Result<()> {
+        if self.has_pending_graphics_query() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        self.set_graphics_probe(GraphicsProbe::Started(deadline));
+        self.graphics_query = Some(PendingGraphicsQuery {
+            deadline,
+            filter: GraphicsProbeFilter { image_id },
+            version: None,
+            acknowledged: false,
+            on_complete: Box::new(on_complete),
+        });
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn finish_graphics_query(&mut self, version: Option<String>) {
+        if let Some(query) = self.graphics_query.take() {
+            self.set_graphics_probe(GraphicsProbe::Finished {
+                expect_late_replies: version.is_none(),
+            });
+            (query.on_complete)(version);
+        }
+    }
+
+    #[cfg(unix)]
+    fn complete_expired_graphics_query(&mut self) {
+        if matches!(&self.graphics_query, Some(query) if Instant::now() >= query.deadline) {
+            self.finish_graphics_query(None);
+        }
+    }
+
+    #[cfg(unix)]
+    fn handle_graphics_reply(&mut self, event: &InternalEvent) -> bool {
+        let Some(query) = self.graphics_query.as_mut() else {
+            return false;
+        };
+        if !query.filter.eval(event) {
+            return false;
+        }
+        match event {
+            InternalEvent::TerminalVersion(version) => query.version = Some(version.clone()),
+            InternalEvent::KittyGraphicsReply { ok: true, .. } => query.acknowledged = true,
+            InternalEvent::KittyGraphicsReply { ok: false, .. } => {
+                self.finish_graphics_query(None);
+                return true;
+            }
+            _ => unreachable!(),
+        }
+        if query.acknowledged && query.version.is_some() {
+            let version = query.version.take();
+            self.finish_graphics_query(version);
+        }
+        true
+    }
+
     /// Returns a `Waker` allowing to wake/force the `poll` method to return `Ok(false)`.
     #[cfg(feature = "event-stream")]
     pub(crate) fn waker(&self) -> Waker {
@@ -50,29 +135,46 @@ impl InternalEventReader {
     where
         F: Filter,
     {
+        #[cfg(unix)]
+        self.complete_expired_graphics_query();
         for event in &self.events {
             if filter.eval(event) {
                 return Ok(true);
             }
         }
 
-        let event_source = match self.source.as_mut() {
-            Some(source) => source,
-            None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Failed to initialize input reader",
-                ))
-            }
-        };
+        if self.source.is_none() {
+            #[cfg(unix)]
+            self.finish_graphics_query(None);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Failed to initialize input reader",
+            ));
+        }
 
         let poll_timeout = PollTimeout::new(timeout);
 
         loop {
-            let maybe_event = match event_source.try_read(poll_timeout.leftover()) {
+            let remaining = poll_timeout.leftover();
+            #[cfg(unix)]
+            let remaining = match &self.graphics_query {
+                Some(query) => {
+                    let query_time = query.deadline.saturating_duration_since(Instant::now());
+                    Some(remaining.map_or(query_time, |remaining| remaining.min(query_time)))
+                }
+                None => remaining,
+            };
+            let result = self.source.as_mut().unwrap().try_read(remaining);
+            #[cfg(unix)]
+            self.complete_expired_graphics_query();
+            let maybe_event = match result {
                 Ok(None) => None,
                 Ok(Some(event)) => {
-                    if filter.eval(&event) {
+                    #[cfg(unix)]
+                    let handled = self.handle_graphics_reply(&event);
+                    #[cfg(not(unix))]
+                    let handled = false;
+                    if !handled && filter.eval(&event) {
                         Some(event)
                     } else {
                         if !event.is_graphics_probe_reply() {
@@ -87,6 +189,8 @@ impl InternalEventReader {
                         return Ok(false);
                     }
 
+                    #[cfg(unix)]
+                    self.finish_graphics_query(None);
                     return Err(e);
                 }
             };
@@ -153,6 +257,8 @@ mod tests {
             events: VecDeque::new(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert!(reader.poll(None, &InternalEventFilter).is_err());
@@ -170,6 +276,8 @@ mod tests {
             events: vec![InternalEvent::Event(Event::Resize(10, 10))].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert!(reader.poll(None, &InternalEventFilter).unwrap());
@@ -186,6 +294,8 @@ mod tests {
             .into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert!(reader.poll(None, &CursorPositionFilter).unwrap());
@@ -199,6 +309,8 @@ mod tests {
             events: vec![EVENT].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
@@ -213,6 +325,8 @@ mod tests {
             events: vec![InternalEvent::Event(Event::Resize(10, 10)), CURSOR_EVENT].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
@@ -228,6 +342,8 @@ mod tests {
             events: vec![SKIPPED_EVENT, CURSOR_EVENT].into(),
             source: None,
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert_eq!(reader.read(&CursorPositionFilter).unwrap(), CURSOR_EVENT);
@@ -246,6 +362,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
         let filter = GraphicsProbeFilter { image_id: 2 };
         assert!(reader
@@ -268,6 +386,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert!(!reader
@@ -283,6 +403,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert!(reader.poll(None, &InternalEventFilter).unwrap());
@@ -301,6 +423,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
@@ -316,6 +440,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
@@ -333,6 +459,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
@@ -349,6 +477,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(FakeSource::new(&[]))),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert_eq!(
@@ -366,6 +496,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(FakeSource::new(&[]))),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert_eq!(
@@ -387,6 +519,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
@@ -406,6 +540,8 @@ mod tests {
             events: VecDeque::new(),
             source: Some(Box::new(source)),
             skipped_events: Vec::with_capacity(32),
+            #[cfg(unix)]
+            graphics_query: None,
         };
 
         assert_eq!(reader.read(&InternalEventFilter).unwrap(), EVENT);
