@@ -34,21 +34,18 @@ pub struct EventStream {
     poll_internal_waker: Waker,
     stream_wake_task_executed: Arc<AtomicBool>,
     stream_wake_task_should_shutdown: Arc<AtomicBool>,
-    task_sender: SyncSender<Task>,
+    task_sender: Option<SyncSender<Task>>,
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl Default for EventStream {
     fn default() -> Self {
         let (task_sender, receiver) = mpsc::sync_channel::<Task>(1);
 
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             while let Ok(task) = receiver.recv() {
-                loop {
+                while !task.stream_wake_task_should_shutdown.load(Ordering::SeqCst) {
                     if let Ok(true) = poll_internal(None, &EventFilter) {
-                        break;
-                    }
-
-                    if task.stream_wake_task_should_shutdown.load(Ordering::SeqCst) {
                         break;
                     }
                 }
@@ -62,7 +59,8 @@ impl Default for EventStream {
             poll_internal_waker: lock_internal_event_reader().waker(),
             stream_wake_task_executed: Arc::new(AtomicBool::new(false)),
             stream_wake_task_should_shutdown: Arc::new(AtomicBool::new(false)),
-            task_sender,
+            task_sender: Some(task_sender),
+            worker: Some(worker),
         }
     }
 }
@@ -71,6 +69,21 @@ impl EventStream {
     /// Constructs a new instance of `EventStream`.
     pub fn new() -> EventStream {
         EventStream::default()
+    }
+
+    /// Stop polling and wait until this stream's reader thread has exited.
+    pub fn close(mut self) {
+        self.stop_polling();
+        drop(self.task_sender.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+
+    fn stop_polling(&self) {
+        self.stream_wake_task_should_shutdown
+            .store(true, Ordering::SeqCst);
+        let _ = self.poll_internal_waker.wake();
     }
 }
 
@@ -123,7 +136,7 @@ impl Stream for EventStream {
 
                     stream_wake_task_should_shutdown.store(false, Ordering::SeqCst);
 
-                    let _ = self.task_sender.send(Task {
+                    let _ = self.task_sender.as_ref().unwrap().send(Task {
                         stream_waker,
                         stream_wake_task_executed,
                         stream_wake_task_should_shutdown,
@@ -139,8 +152,8 @@ impl Stream for EventStream {
 
 impl Drop for EventStream {
     fn drop(&mut self) {
-        self.stream_wake_task_should_shutdown
-            .store(true, Ordering::SeqCst);
-        let _ = self.poll_internal_waker.wake();
+        if self.worker.is_some() {
+            self.stop_polling();
+        }
     }
 }
