@@ -8,7 +8,7 @@ use crate::event::filter::GraphicsProbeFilter;
 #[cfg(windows)]
 use crate::event::source::windows::WindowsEventSource;
 #[cfg(unix)]
-use crate::event::source::{unix::UnixInternalEventSource, GraphicsProbe};
+use crate::event::source::{unix::UnixInternalEventSource, GraphicsProbe, GRAPHICS_DRAIN_TIMEOUT};
 #[cfg(feature = "event-stream")]
 use crate::event::sys::Waker;
 use crate::event::{filter::Filter, source::EventSource, timeout::PollTimeout, InternalEvent};
@@ -19,7 +19,26 @@ pub(crate) struct InternalEventReader {
     source: Option<Box<dyn EventSource>>,
     skipped_events: Vec<InternalEvent>,
     #[cfg(unix)]
-    graphics_query: Option<PendingGraphicsQuery>,
+    graphics_query: Option<GraphicsQuery>,
+}
+
+#[cfg(unix)]
+enum GraphicsQuery {
+    Pending(PendingGraphicsQuery),
+    Draining {
+        deadline: Instant,
+        on_input_ready: Box<dyn FnOnce() + Send>,
+    },
+}
+
+#[cfg(unix)]
+impl GraphicsQuery {
+    fn deadline(&self) -> Instant {
+        match self {
+            Self::Pending(query) => query.deadline,
+            Self::Draining { deadline, .. } => *deadline,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -29,6 +48,7 @@ struct PendingGraphicsQuery {
     version: Option<String>,
     acknowledged: bool,
     on_complete: Box<dyn FnOnce(Option<String>) + Send>,
+    on_input_ready: Box<dyn FnOnce() + Send>,
 }
 
 impl Default for InternalEventReader {
@@ -69,41 +89,67 @@ impl InternalEventReader {
         deadline: Instant,
         image_id: u32,
         on_complete: impl FnOnce(Option<String>) + Send + 'static,
+        on_input_ready: impl FnOnce() + Send + 'static,
     ) -> io::Result<()> {
         if self.has_pending_graphics_query() {
+            on_input_ready();
             return Err(io::ErrorKind::WouldBlock.into());
         }
         self.set_graphics_probe(GraphicsProbe::Started(deadline));
-        self.graphics_query = Some(PendingGraphicsQuery {
+        self.graphics_query = Some(GraphicsQuery::Pending(PendingGraphicsQuery {
             deadline,
             filter: GraphicsProbeFilter { image_id },
             version: None,
             acknowledged: false,
             on_complete: Box::new(on_complete),
-        });
+            on_input_ready: Box::new(on_input_ready),
+        }));
         Ok(())
     }
 
     #[cfg(unix)]
     pub(crate) fn finish_graphics_query(&mut self, version: Option<String>) {
-        if let Some(query) = self.graphics_query.take() {
-            self.set_graphics_probe(GraphicsProbe::Finished {
-                expect_late_replies: version.is_none(),
+        if !matches!(&self.graphics_query, Some(GraphicsQuery::Pending(_))) {
+            return;
+        }
+        let Some(GraphicsQuery::Pending(query)) = self.graphics_query.take() else {
+            unreachable!();
+        };
+        if version.is_none() {
+            let deadline = Instant::now() + GRAPHICS_DRAIN_TIMEOUT;
+            self.set_graphics_probe(GraphicsProbe::DrainingUntil(deadline));
+            self.graphics_query = Some(GraphicsQuery::Draining {
+                deadline,
+                on_input_ready: query.on_input_ready,
             });
+            (query.on_complete)(None);
+        } else {
+            self.set_graphics_probe(GraphicsProbe::Finished {
+                expect_late_replies: false,
+            });
+            (query.on_input_ready)();
             (query.on_complete)(version);
         }
     }
 
     #[cfg(unix)]
+    fn finish_graphics_drain(&mut self) {
+        if let Some(GraphicsQuery::Draining { on_input_ready, .. }) = self.graphics_query.take() {
+            on_input_ready();
+        }
+    }
+
+    #[cfg(unix)]
     fn complete_expired_graphics_query(&mut self) {
-        if matches!(&self.graphics_query, Some(query) if Instant::now() >= query.deadline) {
+        if matches!(&self.graphics_query, Some(GraphicsQuery::Pending(query)) if Instant::now() >= query.deadline)
+        {
             self.finish_graphics_query(None);
         }
     }
 
     #[cfg(unix)]
     fn handle_graphics_reply(&mut self, event: &InternalEvent) -> bool {
-        let Some(query) = self.graphics_query.as_mut() else {
+        let Some(GraphicsQuery::Pending(query)) = self.graphics_query.as_mut() else {
             return false;
         };
         if !query.filter.eval(event) {
@@ -145,7 +191,10 @@ impl InternalEventReader {
 
         if self.source.is_none() {
             #[cfg(unix)]
-            self.finish_graphics_query(None);
+            {
+                self.finish_graphics_query(None);
+                self.finish_graphics_drain();
+            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "Failed to initialize input reader",
@@ -159,7 +208,7 @@ impl InternalEventReader {
             #[cfg(unix)]
             let remaining = match &self.graphics_query {
                 Some(query) => {
-                    let query_time = query.deadline.saturating_duration_since(Instant::now());
+                    let query_time = query.deadline().saturating_duration_since(Instant::now());
                     Some(remaining.map_or(query_time, |remaining| remaining.min(query_time)))
                 }
                 None => remaining,
@@ -167,6 +216,14 @@ impl InternalEventReader {
             let result = self.source.as_mut().unwrap().try_read(remaining);
             #[cfg(unix)]
             self.complete_expired_graphics_query();
+            // The source has polled through the drain deadline and processed
+            // readable bytes before allowing another process to read stdin.
+            #[cfg(unix)]
+            if matches!(&result, Ok(None))
+                && matches!(&self.graphics_query, Some(GraphicsQuery::Draining { deadline, .. }) if Instant::now() >= *deadline)
+            {
+                self.finish_graphics_drain();
+            }
             let maybe_event = match result {
                 Ok(None) => None,
                 Ok(Some(event)) => {
@@ -190,7 +247,10 @@ impl InternalEventReader {
                     }
 
                     #[cfg(unix)]
-                    self.finish_graphics_query(None);
+                    {
+                        self.finish_graphics_query(None);
+                        self.finish_graphics_drain();
+                    }
                     return Err(e);
                 }
             };
@@ -250,6 +310,48 @@ mod tests {
         super::{filter::InternalEventFilter, Event},
         EventSource, InternalEvent, InternalEventReader,
     };
+
+    #[test]
+    #[cfg(unix)]
+    fn graphics_handoff_waits_until_the_reader_has_drained_input() {
+        use super::super::filter::EventFilter;
+        use super::{GraphicsQuery, Instant};
+        use std::sync::mpsc;
+
+        let key = InternalEvent::Event(Event::Resize(10, 10));
+        let source = FakeSource::with_events(&[
+            InternalEvent::TerminalVersion("late terminal reply".into()),
+            key.clone(),
+        ]);
+        let mut reader = InternalEventReader {
+            events: VecDeque::new(),
+            source: Some(Box::new(source)),
+            skipped_events: Vec::new(),
+            graphics_query: None,
+        };
+        let (send_ready, ready) = mpsc::channel();
+        reader
+            .begin_graphics_query(
+                Instant::now(),
+                1,
+                |reply| assert_eq!(reply, None),
+                move || send_ready.send(()).unwrap(),
+            )
+            .unwrap();
+        reader.complete_expired_graphics_query();
+        let Some(GraphicsQuery::Draining { deadline, .. }) = &mut reader.graphics_query else {
+            panic!("a timed-out query should still drain late replies");
+        };
+        *deadline = Instant::now();
+
+        let poll_now = Some(Duration::from_secs(0));
+        assert!(!reader.poll(poll_now, &EventFilter).unwrap());
+        assert!(reader.poll(poll_now, &EventFilter).unwrap());
+        assert_eq!(reader.read(&EventFilter).unwrap(), key);
+        assert_eq!(ready.try_recv(), Err(mpsc::TryRecvError::Empty));
+        assert!(!reader.poll(poll_now, &EventFilter).unwrap());
+        assert_eq!(ready.try_recv(), Ok(()));
+    }
 
     #[test]
     fn test_poll_fails_without_event_source() {

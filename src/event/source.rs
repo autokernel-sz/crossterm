@@ -10,9 +10,13 @@ pub(crate) mod unix;
 pub(crate) mod windows;
 
 #[cfg(unix)]
+pub(super) const GRAPHICS_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
+
+#[cfg(unix)]
 pub(crate) enum GraphicsProbe {
     Started(std::time::Instant),
     Finished { expect_late_replies: bool },
+    DrainingUntil(std::time::Instant),
 }
 
 /// An interface for trying to read an `InternalEvent` within an optional `Duration`.

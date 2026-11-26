@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::event::source::GRAPHICS_DRAIN_TIMEOUT;
 use crate::event::{source::GraphicsProbe, sys::unix::parse::parse_event, InternalEvent};
 
 const VERSION_PREFIX: &[u8] = b"\x1bP>|";
@@ -8,7 +9,6 @@ const GRAPHICS_PREFIX: &[u8] = b"\x1b_Gi=";
 const REPLY_END: &[u8] = b"\x1b\\";
 const AMBIGUOUS_PREFIX_GAP: Duration = Duration::from_millis(35);
 const REPLY_BODY_GAP: Duration = Duration::from_millis(200);
-const PROBE_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
 const MAX_REPLY_LEN: usize = 512;
 
 enum GraphicsReplies {
@@ -45,10 +45,11 @@ impl Parser {
             // Either reply may still be on its way after the caller draws the fallback.
             GraphicsProbe::Finished {
                 expect_late_replies: true,
-            } => GraphicsReplies::Draining(Instant::now() + PROBE_DRAIN_TIMEOUT),
+            } => GraphicsReplies::Draining(Instant::now() + GRAPHICS_DRAIN_TIMEOUT),
             GraphicsProbe::Finished {
                 expect_late_replies: false,
             } => GraphicsReplies::Enabled,
+            GraphicsProbe::DrainingUntil(deadline) => GraphicsReplies::Draining(deadline),
         };
         if self.reply_deadline.is_some() {
             let gap = if reply_prefix(&self.buffer).is_some() {

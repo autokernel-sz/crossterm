@@ -314,7 +314,9 @@ pub fn query_kitty_graphics(
 /// Start a Kitty PNG and terminal version query without waiting for its replies.
 /// Requires raw mode. Call before starting an event stream, or after dropping
 /// the previous one. The shared input reader resolves the query while polling
-/// for ordinary input. The completion callback must not call into the reader.
+/// for ordinary input. `on_input_ready` runs after the replies have been read
+/// or the reader has finished draining late replies. Neither callback may
+/// call into the reader.
 #[cfg(unix)]
 pub fn begin_kitty_graphics_query(
     writer: &mut impl std::io::Write,
@@ -322,10 +324,11 @@ pub fn begin_kitty_graphics_query(
     png_base64: &str,
     timeout: Duration,
     on_complete: impl FnOnce(Option<String>) + Send + 'static,
+    on_input_ready: impl FnOnce() + Send + 'static,
 ) -> std::io::Result<std::time::Instant> {
     let mut reader = lock_internal_event_reader();
     let deadline = std::time::Instant::now() + timeout;
-    reader.begin_graphics_query(deadline, image_id, on_complete)?;
+    reader.begin_graphics_query(deadline, image_id, on_complete, on_input_ready)?;
     if let Err(error) = write_kitty_graphics_query(writer, image_id, png_base64) {
         reader.finish_graphics_query(None);
         return Err(error);
